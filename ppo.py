@@ -83,6 +83,10 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float = None
     """the target KL divergence threshold"""
+    checkpoint_dir: str = "checkpoints"
+    """directory to save model checkpoints"""
+    max_checkpoints: int = 50
+    """maximum number of checkpoints to keep"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -346,48 +350,110 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class Agent(nn.Module):
     """
-    Agent with 1 hidden layer (64 neurons) matching paper configuration.
+    PPO agent with a single-layer attention encoder and linear actor/critic heads.
     """
 
-    def __init__(self, envs, hidden_size=64, activation_fn=nn.ReLU):
+    def __init__(self, envs, hidden_size=64, num_heads=4, slot_dim=5):
         super().__init__()
-        obs_dim = np.array(envs.single_observation_space.shape).prod()
+        obs_dim = int(np.array(envs.single_observation_space.shape).prod())
         action_dim = envs.single_action_space.n
 
-        self.critic = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden_size)),
-            activation_fn(),
-            layer_init(nn.Linear(hidden_size, 1), std=1.0),
-        )
+        if hidden_size % num_heads != 0:
+            num_heads = 1
 
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(obs_dim, hidden_size)),
-            activation_fn(),
-            layer_init(nn.Linear(hidden_size, action_dim), std=0.01),
-        )
+        if obs_dim % slot_dim != 0:
+            slot_dim = obs_dim
+        self.slot_dim = slot_dim
+        self.seq_len = obs_dim // slot_dim
+
+        self.input_proj = layer_init(nn.Linear(self.slot_dim, hidden_size))
+        self.attention = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
+
+        self.actor = layer_init(nn.Linear(hidden_size, action_dim), std=0.01)
+        self.critic = layer_init(nn.Linear(hidden_size, 1), std=1.0)
 
         total_params = sum(p.numel() for p in self.parameters())
-        print(f"Network architecture: 1 hidden layer, {hidden_size} neurons")
+        print("Network architecture: 1 attention layer + linear heads")
         print(f"Total parameters: {total_params:,}")
 
+    def _encode(self, x):
+        x = x.float().view(-1, self.seq_len, self.slot_dim)
+        embeddings = self.input_proj(x)
+        attn_out, _ = self.attention(embeddings, embeddings, embeddings, need_weights=False)
+        return attn_out.mean(dim=1)
+
     def get_value(self, x):
-        return self.critic(x)
+        encoded = self._encode(x)
+        return self.critic(encoded)
 
     def get_action_and_value(self, x, action=None):
-        logits = self.actor(x)
+        encoded = self._encode(x)
+        logits = self.actor(encoded)
         probs = Categorical(logits=logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(encoded)
 
     def get_masked_action_and_value(self, x, action_mask, action=None):
-        logits = self.actor(x)
+        encoded = self._encode(x)
+        logits = self.actor(encoded)
         masked_logits = logits.clone()
         masked_logits[action_mask == 0] = -1e9
         probs = Categorical(logits=masked_logits)
         if action is None:
             action = probs.sample()
-        return action, probs.log_prob(action), probs.entropy(), self.critic(x)
+        return action, probs.log_prob(action), probs.entropy(), self.critic(encoded)
+
+
+def _checkpoint_filename(iteration=None, tag=None):
+    if tag:
+        return f"ppo_checkpoint_{tag}.pt"
+    if iteration is None:
+        raise ValueError("Either iteration or tag must be provided for checkpoint naming.")
+    return f"ppo_checkpoint_{iteration:06d}.pt"
+
+
+def list_checkpoint_paths(checkpoint_dir):
+    if not os.path.exists(checkpoint_dir):
+        return []
+    checkpoints = [
+        os.path.join(checkpoint_dir, name)
+        for name in os.listdir(checkpoint_dir)
+        if name.endswith(".pt")
+    ]
+    return sorted(checkpoints, key=os.path.getmtime)
+
+
+def prune_checkpoints(checkpoint_dir, max_checkpoints):
+    if max_checkpoints <= 0:
+        return
+    checkpoints = list_checkpoint_paths(checkpoint_dir)
+    excess = len(checkpoints) - max_checkpoints
+    for path in checkpoints[:max(0, excess)]:
+        os.remove(path)
+
+
+def save_checkpoint(agent, optimizer, checkpoint_dir, iteration=None, global_step=None, args=None, tag=None):
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    filename = _checkpoint_filename(iteration=iteration, tag=tag)
+    path = os.path.join(checkpoint_dir, filename)
+    payload = {
+        "model_state_dict": agent.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
+        "iteration": iteration,
+        "global_step": global_step,
+        "args": vars(args) if hasattr(args, "__dict__") else args,
+    }
+    torch.save(payload, path)
+    return path
+
+
+def load_checkpoint(path, agent, optimizer=None, map_location="cpu"):
+    payload = torch.load(path, map_location=map_location)
+    agent.load_state_dict(payload["model_state_dict"])
+    if optimizer is not None and payload.get("optimizer_state_dict") is not None:
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+    return payload
 
 
 # ==================== Training Function ====================
@@ -432,6 +498,8 @@ def train_ppo(args, logger=None):
 
     agent = Agent(envs, hidden_size=64, activation_fn=nn.ReLU).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
 
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -623,6 +691,27 @@ def train_ppo(args, logger=None):
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+        save_checkpoint(
+            agent,
+            optimizer,
+            checkpoint_dir,
+            iteration=iteration,
+            global_step=global_step,
+            args=args,
+        )
+        prune_checkpoints(checkpoint_dir, args.max_checkpoints)
+
+    save_checkpoint(
+        agent,
+        optimizer,
+        checkpoint_dir,
+        iteration=args.num_iterations,
+        global_step=global_step,
+        args=args,
+        tag="final",
+    )
+    prune_checkpoints(checkpoint_dir, args.max_checkpoints)
 
     envs.close()
     writer.close()
